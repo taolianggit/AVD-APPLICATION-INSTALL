@@ -1,0 +1,1940 @@
+# ============================================================
+# AVD Golden Image - Developer / Test Tools V1
+#
+# Install / Upgrade / Verify / Cleanup
+#
+# Applications:
+#  1. Git for Windows
+#  2. SoapUI
+#  3. Power BI Desktop
+#  4. MySQL Workbench
+#  5. SourceTree Enterprise
+#  6. Visual Studio Code
+#  7. AWS Elastic Beanstalk CLI
+#  8. PHP 8.3
+#  9. SmartBear TestComplete
+#
+# Designed for AVD Golden Images.
+# Run elevated.
+# ============================================================
+
+$ErrorActionPreference = "Stop"
+
+
+# ============================================================
+# Configuration
+# ============================================================
+
+$WorkingRoot = "C:\Windows\Temp\AVD-DevTools"
+
+$Results = [System.Collections.Generic.List[object]]::new()
+
+
+# ------------------------------------------------------------
+# SourceTree
+#
+# IMPORTANT:
+# Use SourceTree Enterprise MSI for Golden Image / all users.
+# Do NOT use normal user-scope SourceTreeSetup.exe.
+#
+# Example:
+# \\server\software\SourceTree\SourceTreeEnterpriseSetup.msi
+# ------------------------------------------------------------
+
+$SourceTreeEnterpriseMsi = `
+    "\\SERVER\Software\SourceTree\SourceTreeEnterpriseSetup.msi"
+
+
+# ------------------------------------------------------------
+# SmartBear TestComplete
+#
+# Put the corporate TestComplete installer on a share.
+#
+# Current example baseline:
+# TestComplete 15.84
+# ------------------------------------------------------------
+
+$TestCompleteInstaller = `
+    "\\SERVER\Software\TestComplete\TestComplete1584_Release.exe"
+
+$TestCompleteTargetVersion = [version]"15.84"
+
+
+# Install all licensed modules if no module switches specified.
+# Add -SLM here if you use SmartBear ID-based licensing.
+
+$TestCompleteExtraArguments = @()
+
+
+# ------------------------------------------------------------
+# PHP baseline
+# ------------------------------------------------------------
+
+$PHPWingetId = "PHP.PHP.8.3"
+
+
+# ------------------------------------------------------------
+# AWS EB CLI
+# ------------------------------------------------------------
+
+$EBCLIInstallRoot = "C:\ProgramData\AWS-EBCLI"
+
+$PythonWingetId = "Python.Python.3.11"
+
+
+# ------------------------------------------------------------
+# Cleanup
+# ------------------------------------------------------------
+
+$RunDISMCleanup = $true
+
+
+# ============================================================
+# Result helper
+# ============================================================
+
+function Add-Result {
+
+    param(
+        [string]$Name,
+        [string]$Status,
+        [string]$Message
+    )
+
+    $Results.Add(
+        [PSCustomObject]@{
+            Application = $Name
+            Status      = $Status
+            Message     = $Message
+        }
+    )
+}
+
+
+# ============================================================
+# Find Winget
+# ============================================================
+
+function Get-WingetPath {
+
+    $Command = Get-Command winget.exe -ErrorAction SilentlyContinue
+
+    if ($Command) {
+        return $Command.Source
+    }
+
+
+    $Package = Get-AppxPackage Microsoft.DesktopAppInstaller `
+        -ErrorAction SilentlyContinue |
+        Sort-Object Version -Descending |
+        Select-Object -First 1
+
+    if ($Package) {
+
+        $Exe = Join-Path $Package.InstallLocation "winget.exe"
+
+        if (Test-Path $Exe) {
+            return $Exe
+        }
+    }
+
+
+    $Package = Get-AppxPackage -AllUsers Microsoft.DesktopAppInstaller `
+        -ErrorAction SilentlyContinue |
+        Sort-Object Version -Descending |
+        Select-Object -First 1
+
+    if ($Package) {
+
+        $Exe = Join-Path $Package.InstallLocation "winget.exe"
+
+        if (Test-Path $Exe) {
+            return $Exe
+        }
+    }
+
+
+    $Candidate = Get-ChildItem `
+        "C:\Program Files\WindowsApps\Microsoft.DesktopAppInstaller_*\winget.exe" `
+        -ErrorAction SilentlyContinue |
+        Sort-Object FullName -Descending |
+        Select-Object -First 1
+
+
+    if ($Candidate) {
+        return $Candidate.FullName
+    }
+
+
+    return $null
+}
+
+
+# ============================================================
+# Test Winget package installed
+# ============================================================
+
+function Test-WingetPackageInstalled {
+
+    param(
+        [string]$Id
+    )
+
+    try {
+
+        $Output = & $Winget list `
+            --id $Id `
+            --exact `
+            --accept-source-agreements `
+            --disable-interactivity 2>&1
+
+
+        return (
+            $Output -match [regex]::Escape($Id)
+        )
+    }
+    catch {
+
+        return $false
+    }
+}
+
+
+# ============================================================
+# Test Winget update
+# ============================================================
+
+function Test-WingetUpgradeAvailable {
+
+    param(
+        [string]$Id
+    )
+
+    try {
+
+        $Output = & $Winget list `
+            --id $Id `
+            --exact `
+            --upgrade-available `
+            --accept-source-agreements `
+            --disable-interactivity 2>&1
+
+
+        return (
+            $Output -match [regex]::Escape($Id)
+        )
+    }
+    catch {
+
+        return $false
+    }
+}
+
+
+# ============================================================
+# Winget Install / Upgrade
+# ============================================================
+
+function InstallOrUpdate-WingetPackage {
+
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [Parameter(Mandatory)]
+        [string]$Id,
+
+        [string]$Architecture,
+
+        [string]$Scope,
+
+        [string]$InstallerType
+    )
+
+
+    Write-Host ""
+    Write-Host "=================================================="
+    Write-Host "Processing : $Name"
+    Write-Host "Package ID : $Id"
+    Write-Host "=================================================="
+
+
+    try {
+
+        # ----------------------------------------------------
+        # Confirm package exists
+        # ----------------------------------------------------
+
+        $ShowArgs = @(
+            "show"
+            "--id", $Id
+            "--exact"
+            "--source", "winget"
+            "--accept-source-agreements"
+            "--disable-interactivity"
+        )
+
+
+        & $Winget @ShowArgs | Out-Null
+
+        if ($LASTEXITCODE -ne 0) {
+
+            throw "Package not found in WinGet repository."
+        }
+
+
+        # ----------------------------------------------------
+        # Installed?
+        # ----------------------------------------------------
+
+        $Installed = Test-WingetPackageInstalled -Id $Id
+
+
+        # ====================================================
+        # INSTALL
+        # ====================================================
+
+        if (-not $Installed) {
+
+            Write-Host "[INFO] Not installed. Installing..."
+
+
+            $Args = @(
+                "install"
+                "--id", $Id
+                "--exact"
+                "--source", "winget"
+                "--silent"
+                "--disable-interactivity"
+                "--accept-source-agreements"
+                "--accept-package-agreements"
+            )
+
+
+            if ($Architecture) {
+
+                $Args += @(
+                    "--architecture",
+                    $Architecture
+                )
+            }
+
+
+            if ($Scope) {
+
+                $Args += @(
+                    "--scope",
+                    $Scope
+                )
+            }
+
+
+            if ($InstallerType) {
+
+                $Args += @(
+                    "--installer-type",
+                    $InstallerType
+                )
+            }
+
+
+            & $Winget @Args
+
+
+            if ($LASTEXITCODE -ne 0) {
+
+                throw "Install returned exit code $LASTEXITCODE"
+            }
+
+
+            Write-Host "[OK] Installed."
+
+
+            Add-Result `
+                -Name $Name `
+                -Status "Success" `
+                -Message "Installed"
+
+            return
+        }
+
+
+        # ====================================================
+        # ALREADY INSTALLED
+        # ====================================================
+
+        Write-Host "[INFO] Already installed."
+
+
+        $UpgradeAvailable = `
+            Test-WingetUpgradeAvailable -Id $Id
+
+
+        if (-not $UpgradeAvailable) {
+
+            Write-Host "[OK] Already up to date."
+
+
+            Add-Result `
+                -Name $Name `
+                -Status "Success" `
+                -Message "Already up to date"
+
+            return
+        }
+
+
+        # ====================================================
+        # UPGRADE
+        # ====================================================
+
+        Write-Host "[INFO] Update available. Upgrading..."
+
+
+        $Args = @(
+            "upgrade"
+            "--id", $Id
+            "--exact"
+            "--source", "winget"
+            "--silent"
+            "--disable-interactivity"
+            "--accept-source-agreements"
+            "--accept-package-agreements"
+        )
+
+
+        if ($Architecture) {
+
+            $Args += @(
+                "--architecture",
+                $Architecture
+            )
+        }
+
+
+        if ($Scope) {
+
+            $Args += @(
+                "--scope",
+                $Scope
+            )
+        }
+
+
+        if ($InstallerType) {
+
+            $Args += @(
+                "--installer-type",
+                $InstallerType
+            )
+        }
+
+
+        & $Winget @Args
+
+
+        if ($LASTEXITCODE -ne 0) {
+
+            throw "Upgrade returned exit code $LASTEXITCODE"
+        }
+
+
+        Write-Host "[OK] Upgraded."
+
+
+        Add-Result `
+            -Name $Name `
+            -Status "Success" `
+            -Message "Upgraded"
+    }
+    catch {
+
+        $Message = $_.Exception.Message
+
+        Write-Warning "$Name failed: $Message"
+
+
+        Add-Result `
+            -Name $Name `
+            -Status "Failed" `
+            -Message $Message
+    }
+}
+
+
+# ============================================================
+# Preflight
+# ============================================================
+
+Write-Host ""
+Write-Host "=================================================="
+Write-Host " AVD Developer / Test Tools"
+Write-Host "=================================================="
+
+
+$Identity = `
+    [Security.Principal.WindowsIdentity]::GetCurrent()
+
+$Principal = `
+    New-Object Security.Principal.WindowsPrincipal($Identity)
+
+
+if (
+    -not $Principal.IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator
+    )
+) {
+
+    throw "Run this script from an elevated PowerShell session."
+}
+
+
+$OS = Get-CimInstance Win32_OperatingSystem
+
+
+if ($OS.OSArchitecture -notmatch "64") {
+
+    throw "This script requires x64 Windows."
+}
+
+
+Write-Host "OS           : $($OS.Caption)"
+Write-Host "Build        : $($OS.BuildNumber)"
+Write-Host "Architecture : $($OS.OSArchitecture)"
+
+
+# ============================================================
+# Working folder
+# ============================================================
+
+if (Test-Path $WorkingRoot) {
+
+    Remove-Item `
+        $WorkingRoot `
+        -Recurse `
+        -Force `
+        -ErrorAction SilentlyContinue
+}
+
+
+New-Item `
+    $WorkingRoot `
+    -ItemType Directory `
+    -Force |
+    Out-Null
+
+
+# ============================================================
+# Winget
+# ============================================================
+
+$Winget = Get-WingetPath
+
+
+if (-not $Winget) {
+
+    throw "winget.exe could not be located."
+}
+
+
+Write-Host ""
+Write-Host "WinGet: $Winget"
+
+& $Winget --version
+
+
+Write-Host ""
+Write-Host "Updating WinGet source..."
+
+
+& $Winget source update `
+    --disable-interactivity `
+    --accept-source-agreements
+
+
+# ============================================================
+# 1. Git for Windows
+# ============================================================
+
+InstallOrUpdate-WingetPackage `
+    -Name "Git for Windows" `
+    -Id "Git.Git" `
+    -Architecture "x64" `
+    -Scope "machine"
+
+
+# ============================================================
+# 2. SoapUI
+# ============================================================
+
+InstallOrUpdate-WingetPackage `
+    -Name "SmartBear SoapUI" `
+    -Id "SmartBear.SoapUI" `
+    -Architecture "x64" `
+    -Scope "machine"
+
+
+# ============================================================
+# 3. Power BI Desktop
+# ============================================================
+
+InstallOrUpdate-WingetPackage `
+    -Name "Microsoft Power BI Desktop" `
+    -Id "Microsoft.PowerBI" `
+    -Architecture "x64" `
+    -Scope "machine"
+
+
+# ============================================================
+# 4. MySQL Workbench
+# ============================================================
+
+InstallOrUpdate-WingetPackage `
+    -Name "MySQL Workbench" `
+    -Id "Oracle.MySQLWorkbench" `
+    -Architecture "x64" `
+    -Scope "machine"
+
+
+# ============================================================
+# 5. SourceTree Enterprise
+#
+# Normal Winget SourceTree is user-scope.
+# Do NOT use it for Golden Image.
+# ============================================================
+
+Write-Host ""
+Write-Host "=================================================="
+Write-Host "Processing : SourceTree Enterprise"
+Write-Host "=================================================="
+
+
+try {
+
+    $SourceTreeInstalled = `
+        Get-ItemProperty `
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" `
+            -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.DisplayName -match "SourceTree"
+        } |
+        Select-Object -First 1
+
+
+    if (-not (Test-Path $SourceTreeEnterpriseMsi)) {
+
+        throw "SourceTree Enterprise MSI not found: $SourceTreeEnterpriseMsi"
+    }
+
+
+    # MSI installation is idempotent enough for Golden Image
+    # maintenance and also refreshes/updates an older enterprise
+    # installation when a newer MSI is supplied.
+
+    Write-Host "[INFO] Installing/updating SourceTree Enterprise..."
+
+
+    $MSIProcess = Start-Process `
+        -FilePath "msiexec.exe" `
+        -ArgumentList @(
+            "/i"
+            "`"$SourceTreeEnterpriseMsi`""
+            "ACCEPTEULA=1"
+            "ALLUSERS=1"
+            "/qn"
+            "/norestart"
+        ) `
+        -Wait `
+        -PassThru
+
+
+    if (
+        $MSIProcess.ExitCode -notin @(0,3010,1641)
+    ) {
+
+        throw "MSI returned exit code $($MSIProcess.ExitCode)"
+    }
+
+
+    Add-Result `
+        -Name "SourceTree Enterprise" `
+        -Status "Success" `
+        -Message "Installed / updated"
+
+    Write-Host "[OK] SourceTree Enterprise installed/updated."
+}
+catch {
+
+    Write-Warning $_.Exception.Message
+
+
+    Add-Result `
+        -Name "SourceTree Enterprise" `
+        -Status "Warning" `
+        -Message $_.Exception.Message
+}
+
+
+# ============================================================
+# 6. Visual Studio Code
+# ============================================================
+
+InstallOrUpdate-WingetPackage `
+    -Name "Visual Studio Code" `
+    -Id "Microsoft.VisualStudioCode" `
+    -Architecture "x64" `
+    -Scope "machine"
+
+
+# ============================================================
+# AWS Elastic Beanstalk CLI - V2.2
+#
+# Strategy:
+# 1. Ensure working directory exists
+# 2. Install/update Python 3.11 machine-wide
+# 3. Locate the real Python executable
+# 4. Add Python + Scripts to Machine PATH
+# 5. Verify/upgrade pip
+# 6. Install/update virtualenv
+# 7. Locate Git
+# 8. Clone AWS official EB CLI setup repository
+# 9. Install/update EB CLI under C:\ProgramData\AWS-EBCLI
+# 10. Locate actual EB CLI executable/wrappers
+# 11. Add EB CLI Scripts directory to Machine PATH
+# 12. Verify eb --version
+# ============================================================
+
+Write-Host ""
+Write-Host "=================================================="
+Write-Host "Processing : AWS Elastic Beanstalk CLI"
+Write-Host "=================================================="
+
+
+try {
+
+    # --------------------------------------------------------
+    # 1. Ensure working directory exists
+    # --------------------------------------------------------
+
+    if (-not $WorkingRoot) {
+        $WorkingRoot = "C:\Windows\Temp\AVD-DevTools"
+    }
+
+    if (-not (Test-Path $WorkingRoot)) {
+
+        New-Item `
+            -Path $WorkingRoot `
+            -ItemType Directory `
+            -Force |
+            Out-Null
+    }
+
+
+    # --------------------------------------------------------
+    # 2. Install / Update Python 3.11 machine-wide
+    # --------------------------------------------------------
+
+    InstallOrUpdate-WingetPackage `
+        -Name "Python 3.11" `
+        -Id "Python.Python.3.11" `
+        -Architecture "x64" `
+        -Scope "machine"
+
+
+    # --------------------------------------------------------
+    # 3. Locate REAL Python 3.11
+    # --------------------------------------------------------
+
+    Write-Host ""
+    Write-Host "Locating Python 3.11..."
+
+
+    $PythonCandidates = @(
+        "C:\Program Files\Python311\python.exe"
+    )
+
+
+    $PythonCandidates += @(
+        Get-ChildItem `
+            "C:\Program Files\Python311*\python.exe" `
+            -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty FullName
+    )
+
+
+    $PythonExe = $null
+
+
+    foreach ($Candidate in ($PythonCandidates | Select-Object -Unique)) {
+
+        if (-not $Candidate) {
+            continue
+        }
+
+        if (-not (Test-Path $Candidate)) {
+            continue
+        }
+
+        if ($Candidate -match "\\Microsoft\\WindowsApps\\") {
+            continue
+        }
+
+
+        $OldEAP = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+
+        try {
+
+            $PythonOutput = & $Candidate --version 2>&1
+            $PythonExit   = $LASTEXITCODE
+        }
+        finally {
+
+            $ErrorActionPreference = $OldEAP
+        }
+
+
+        if (
+            $PythonExit -eq 0 -and
+            $PythonOutput -match '^Python 3\.11'
+        ) {
+
+            $PythonExe = $Candidate
+            break
+        }
+    }
+
+
+    if (-not $PythonExe) {
+
+        throw "Python 3.11 was installed but a valid python.exe could not be located."
+    }
+
+
+    Write-Host "[OK] Python located:"
+    Write-Host "     $PythonExe"
+
+
+    $OldEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+
+    try {
+
+        $PythonVersionOutput = & $PythonExe --version 2>&1
+        $PythonExit = $LASTEXITCODE
+    }
+    finally {
+
+        $ErrorActionPreference = $OldEAP
+    }
+
+
+    $PythonVersionOutput |
+        ForEach-Object {
+            Write-Host $_
+        }
+
+
+    if ($PythonExit -ne 0) {
+
+        throw "Python verification failed."
+    }
+
+
+    # --------------------------------------------------------
+    # 4. Add Python and Scripts to MACHINE PATH
+    # --------------------------------------------------------
+
+    $PythonRoot = Split-Path `
+        $PythonExe `
+        -Parent
+
+
+    $PythonScripts = Join-Path `
+        $PythonRoot `
+        "Scripts"
+
+
+    $MachinePath = `
+        [Environment]::GetEnvironmentVariable(
+            "Path",
+            "Machine"
+        )
+
+
+    if (-not $MachinePath) {
+        $MachinePath = ""
+    }
+
+
+    $MachinePathParts = @(
+        $MachinePath -split ";" |
+        Where-Object {
+            $_ -and $_.Trim()
+        }
+    )
+
+
+    if ($MachinePathParts -notcontains $PythonRoot) {
+
+        $MachinePath = (
+            $MachinePath.TrimEnd(";") +
+            ";" +
+            $PythonRoot
+        )
+
+        Write-Host "[OK] Added Python to machine PATH."
+    }
+
+
+    $MachinePathParts = @(
+        $MachinePath -split ";" |
+        Where-Object {
+            $_ -and $_.Trim()
+        }
+    )
+
+
+    if ($MachinePathParts -notcontains $PythonScripts) {
+
+        $MachinePath = (
+            $MachinePath.TrimEnd(";") +
+            ";" +
+            $PythonScripts
+        )
+
+        Write-Host "[OK] Added Python Scripts to machine PATH."
+    }
+
+
+    [Environment]::SetEnvironmentVariable(
+        "Path",
+        $MachinePath,
+        "Machine"
+    )
+
+
+    # Refresh current process PATH
+
+    $env:Path = (
+        [Environment]::GetEnvironmentVariable(
+            "Path",
+            "Machine"
+        )
+    ) + ";" + (
+        [Environment]::GetEnvironmentVariable(
+            "Path",
+            "User"
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # 5. Verify pip
+    # --------------------------------------------------------
+
+    Write-Host ""
+    Write-Host "Checking pip..."
+
+
+    $OldEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+
+    try {
+
+        $PipOutput = & $PythonExe `
+            -m pip `
+            --version 2>&1
+
+        $PipExit = $LASTEXITCODE
+    }
+    finally {
+
+        $ErrorActionPreference = $OldEAP
+    }
+
+
+    $PipOutput |
+        ForEach-Object {
+            Write-Host $_
+        }
+
+
+    # --------------------------------------------------------
+    # pip missing -> ensurepip
+    # --------------------------------------------------------
+
+    if ($PipExit -ne 0) {
+
+        Write-Host "[INFO] pip is not available. Running ensurepip..."
+
+
+        $OldEAP = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+
+        try {
+
+            $EnsureOutput = & $PythonExe `
+                -m ensurepip `
+                --upgrade 2>&1
+
+            $EnsureExit = $LASTEXITCODE
+        }
+        finally {
+
+            $ErrorActionPreference = $OldEAP
+        }
+
+
+        $EnsureOutput |
+            ForEach-Object {
+                Write-Host $_
+            }
+
+
+        if ($EnsureExit -ne 0) {
+
+            throw "ensurepip failed. Exit code: $EnsureExit"
+        }
+    }
+
+
+    # --------------------------------------------------------
+    # Upgrade pip
+    # --------------------------------------------------------
+
+    Write-Host ""
+    Write-Host "Upgrading pip..."
+
+
+    $OldEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+
+    try {
+
+        $PipUpgradeOutput = & $PythonExe `
+            -m pip install `
+            --upgrade `
+            pip 2>&1
+
+        $PipUpgradeExit = $LASTEXITCODE
+    }
+    finally {
+
+        $ErrorActionPreference = $OldEAP
+    }
+
+
+    $PipUpgradeOutput |
+        ForEach-Object {
+            Write-Host $_
+        }
+
+
+    if ($PipUpgradeExit -ne 0) {
+
+        throw "pip upgrade failed. Exit code: $PipUpgradeExit"
+    }
+
+
+    Write-Host "[OK] pip is ready."
+
+
+    # --------------------------------------------------------
+    # 6. Install / Update virtualenv
+    # --------------------------------------------------------
+
+    Write-Host ""
+    Write-Host "Installing/updating virtualenv..."
+
+
+    $OldEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+
+    try {
+
+        $VirtualenvOutput = & $PythonExe `
+            -m pip install `
+            --upgrade `
+            virtualenv 2>&1
+
+        $VirtualenvExit = $LASTEXITCODE
+    }
+    finally {
+
+        $ErrorActionPreference = $OldEAP
+    }
+
+
+    $VirtualenvOutput |
+        ForEach-Object {
+            Write-Host $_
+        }
+
+
+    if ($VirtualenvExit -ne 0) {
+
+        throw "virtualenv installation failed. Exit code: $VirtualenvExit"
+    }
+
+
+    Write-Host "[OK] virtualenv is ready."
+
+
+    # --------------------------------------------------------
+    # 7. Locate Git
+    # --------------------------------------------------------
+
+    Write-Host ""
+    Write-Host "Locating Git..."
+
+
+    $GitCandidates = @(
+        "C:\Program Files\Git\cmd\git.exe",
+        "C:\Program Files\Git\bin\git.exe"
+    )
+
+
+    $GitExe = $null
+
+
+    foreach ($Candidate in $GitCandidates) {
+
+        if (Test-Path $Candidate) {
+
+            $GitExe = $Candidate
+            break
+        }
+    }
+
+
+    if (-not $GitExe) {
+
+        $GitCommand = Get-Command git.exe `
+            -ErrorAction SilentlyContinue
+
+
+        if ($GitCommand) {
+
+            $GitExe = $GitCommand.Source
+        }
+    }
+
+
+    if (-not $GitExe) {
+
+        throw "Git for Windows could not be located."
+    }
+
+
+    Write-Host "[OK] Git located:"
+    Write-Host "     $GitExe"
+
+
+    # --------------------------------------------------------
+    # 8. Clone AWS official EB CLI setup repository
+    # --------------------------------------------------------
+
+    $EBRepo = Join-Path `
+        $WorkingRoot `
+        "aws-elastic-beanstalk-cli-setup"
+
+
+    if (Test-Path $EBRepo) {
+
+        Remove-Item `
+            $EBRepo `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
+    }
+
+
+    Write-Host ""
+    Write-Host "Downloading AWS EB CLI setup repository..."
+
+
+    $OldEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+
+    try {
+
+        $GitOutput = & $GitExe `
+            clone `
+            --depth 1 `
+            "https://github.com/aws/aws-elastic-beanstalk-cli-setup.git" `
+            $EBRepo 2>&1
+
+        $GitExit = $LASTEXITCODE
+    }
+    finally {
+
+        $ErrorActionPreference = $OldEAP
+    }
+
+
+    $GitOutput |
+        ForEach-Object {
+            Write-Host $_
+        }
+
+
+    if ($GitExit -ne 0) {
+
+        throw "Unable to clone AWS EB CLI setup repository. Exit code: $GitExit"
+    }
+
+
+    # --------------------------------------------------------
+    # 9. Install / Update AWS EB CLI
+    # --------------------------------------------------------
+
+    $EBInstaller = Join-Path `
+        $EBRepo `
+        "scripts\ebcli_installer.py"
+
+
+    if (-not (Test-Path $EBInstaller)) {
+
+        throw "AWS EB CLI installer script was not found."
+    }
+
+
+    $EBCLIInstallRoot = `
+        "C:\ProgramData\AWS-EBCLI"
+
+
+    Write-Host ""
+    Write-Host "Installing/updating AWS EB CLI..."
+    Write-Host "Target: $EBCLIInstallRoot"
+
+
+    $OldEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+
+    try {
+
+        $EBInstallOutput = & $PythonExe `
+            $EBInstaller `
+            --location $EBCLIInstallRoot `
+            --python-installation $PythonExe `
+            --quiet 2>&1
+
+        $EBInstallExit = $LASTEXITCODE
+    }
+    finally {
+
+        $ErrorActionPreference = $OldEAP
+    }
+
+
+    $EBInstallOutput |
+        ForEach-Object {
+            Write-Host $_
+        }
+
+
+    if ($EBInstallExit -ne 0) {
+
+        throw "AWS EB CLI installer failed. Exit code: $EBInstallExit"
+    }
+
+
+    # --------------------------------------------------------
+    # 10. Locate actual EB CLI executable / wrappers
+    #
+    # Expected structure:
+    #
+    # C:\ProgramData\AWS-EBCLI
+    #   \.ebcli-virtual-env
+    #       \Scripts
+    #           eb.exe
+    #       \executables
+    #           eb.bat
+    #           eb.ps1
+    # --------------------------------------------------------
+
+    Write-Host ""
+    Write-Host "Locating AWS EB CLI executable..."
+
+
+    $EBVirtualEnvRoot = `
+        "$EBCLIInstallRoot\.ebcli-virtual-env"
+
+
+    $EBScriptsPath = `
+        "$EBVirtualEnvRoot\Scripts"
+
+
+    $EBWrapperPath = `
+        "$EBVirtualEnvRoot\executables"
+
+
+    $EBCandidates = @(
+        "$EBScriptsPath\eb.exe",
+        "$EBWrapperPath\eb.bat",
+        "$EBWrapperPath\eb.ps1",
+        "$EBWrapperPath\eb.cmd"
+    )
+
+
+    $EBExePath = $null
+
+
+    foreach ($Candidate in $EBCandidates) {
+
+        if (Test-Path $Candidate) {
+
+            $EBExePath = $Candidate
+            break
+        }
+    }
+
+
+    # Fallback recursive search
+
+    if (-not $EBExePath) {
+
+        $EBFound = Get-ChildItem `
+            $EBCLIInstallRoot `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Name -in @(
+                "eb.exe",
+                "eb.bat",
+                "eb.ps1",
+                "eb.cmd"
+            )
+        } |
+        Select-Object -First 1
+
+
+        if ($EBFound) {
+
+            $EBExePath = $EBFound.FullName
+        }
+    }
+
+
+    if (-not $EBExePath) {
+
+        throw "EB CLI installation finished but no eb executable was found under $EBCLIInstallRoot."
+    }
+
+
+    Write-Host "[OK] AWS EB CLI executable located:"
+    Write-Host "     $EBExePath"
+
+
+    # --------------------------------------------------------
+    # 11. Add EB CLI Scripts directory to MACHINE PATH
+    #
+    # Prefer:
+    # .ebcli-virtual-env\Scripts
+    #
+    # because it contains the actual eb.exe.
+    # --------------------------------------------------------
+
+    if (Test-Path $EBScriptsPath) {
+
+        $EBPathForMachine = $EBScriptsPath
+    }
+    else {
+
+        $EBPathForMachine = `
+            Split-Path `
+                $EBExePath `
+                -Parent
+    }
+
+
+    $MachinePath = `
+        [Environment]::GetEnvironmentVariable(
+            "Path",
+            "Machine"
+        )
+
+
+    if (-not $MachinePath) {
+        $MachinePath = ""
+    }
+
+
+    $MachinePathParts = @(
+        $MachinePath -split ";" |
+        Where-Object {
+            $_ -and $_.Trim()
+        }
+    )
+
+
+    if ($MachinePathParts -notcontains $EBPathForMachine) {
+
+        $MachinePath = (
+            $MachinePath.TrimEnd(";") +
+            ";" +
+            $EBPathForMachine
+        )
+
+
+        [Environment]::SetEnvironmentVariable(
+            "Path",
+            $MachinePath,
+            "Machine"
+        )
+
+
+        Write-Host "[OK] Added AWS EB CLI to machine PATH:"
+        Write-Host "     $EBPathForMachine"
+    }
+    else {
+
+        Write-Host "[OK] AWS EB CLI path already exists in machine PATH:"
+        Write-Host "     $EBPathForMachine"
+    }
+
+
+    # Refresh current process PATH
+
+    $env:Path = (
+        [Environment]::GetEnvironmentVariable(
+            "Path",
+            "Machine"
+        )
+    ) + ";" + (
+        [Environment]::GetEnvironmentVariable(
+            "Path",
+            "User"
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # 12. Verify AWS EB CLI
+    # --------------------------------------------------------
+
+    Write-Host ""
+    Write-Host "Verifying AWS EB CLI..."
+
+
+    $OldEAP = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+
+    try {
+
+        if ($EBExePath -match '\.ps1$') {
+
+            $EBVersionOutput = & powershell.exe `
+                -NoProfile `
+                -ExecutionPolicy Bypass `
+                -File $EBExePath `
+                --version 2>&1
+        }
+        else {
+
+            $EBVersionOutput = & $EBExePath `
+                --version 2>&1
+        }
+
+
+        $EBVersionExit = $LASTEXITCODE
+    }
+    finally {
+
+        $ErrorActionPreference = $OldEAP
+    }
+
+
+    $EBVersionOutput |
+        ForEach-Object {
+            Write-Host $_
+        }
+
+
+    if ($EBVersionExit -ne 0) {
+
+        throw "AWS EB CLI verification failed. Exit code: $EBVersionExit"
+    }
+
+
+    $EBVersion = `
+        ($EBVersionOutput -join " ").Trim()
+
+
+    Write-Host ""
+    Write-Host "[OK] AWS EB CLI is ready."
+    Write-Host "     $EBVersion"
+
+
+    Add-Result `
+        -Name "AWS EB CLI" `
+        -Status "Success" `
+        -Message $EBVersion
+}
+catch {
+
+    $Message = $_.Exception.Message
+
+    Write-Warning "AWS EB CLI failed: $Message"
+
+
+    Add-Result `
+        -Name "AWS EB CLI" `
+        -Status "Failed" `
+        -Message $Message
+}
+
+
+# ============================================================
+# 8. PHP 8.3
+# ============================================================
+
+InstallOrUpdate-WingetPackage `
+    -Name "PHP 8.3 x64" `
+    -Id $PHPWingetId `
+    -Architecture "x64"
+
+
+# ============================================================
+# PHP verification
+# ============================================================
+
+Write-Host ""
+Write-Host "Checking PHP..."
+
+
+$PHP = Get-Command php.exe `
+    -ErrorAction SilentlyContinue
+
+
+if ($PHP) {
+
+    & $PHP.Source --version
+}
+else {
+
+    Write-Warning `
+        "PHP installed by WinGet but php.exe is not in the current PATH. A new logon/session may be required."
+}
+
+
+# ============================================================
+# 9. SmartBear TestComplete
+#
+# TestComplete cannot reliably be sourced through WinGet.
+# Use corporate installer package.
+# ============================================================
+
+Write-Host ""
+Write-Host "=================================================="
+Write-Host "Processing : SmartBear TestComplete"
+Write-Host "=================================================="
+
+
+try {
+
+    # --------------------------------------------------------
+    # Detect installed version
+    # --------------------------------------------------------
+
+    $TCInstalled = @(
+
+        Get-ItemProperty `
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" `
+            -ErrorAction SilentlyContinue
+
+        Get-ItemProperty `
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*" `
+            -ErrorAction SilentlyContinue
+
+    ) |
+    Where-Object {
+
+        $_.DisplayName -match "^TestComplete"
+    } |
+    Sort-Object DisplayVersion -Descending |
+    Select-Object -First 1
+
+
+    $NeedTestCompleteInstall = $true
+
+
+    if ($TCInstalled) {
+
+        Write-Host `
+            "Installed TestComplete: $($TCInstalled.DisplayVersion)"
+
+
+        try {
+
+            $InstalledVersion = `
+                [version]$TCInstalled.DisplayVersion
+
+
+            if (
+                $InstalledVersion -ge
+                $TestCompleteTargetVersion
+            ) {
+
+                $NeedTestCompleteInstall = $false
+            }
+        }
+        catch {
+        }
+    }
+
+
+    # --------------------------------------------------------
+    # Already current
+    # --------------------------------------------------------
+
+    if (-not $NeedTestCompleteInstall) {
+
+        Write-Host `
+            "[OK] TestComplete is already at or above baseline $TestCompleteTargetVersion."
+
+
+        Add-Result `
+            -Name "SmartBear TestComplete" `
+            -Status "Success" `
+            -Message "Already current: $($TCInstalled.DisplayVersion)"
+    }
+
+
+    # --------------------------------------------------------
+    # Install / Update
+    # --------------------------------------------------------
+
+    if ($NeedTestCompleteInstall) {
+
+        if (-not (Test-Path $TestCompleteInstaller)) {
+
+            throw `
+                "TestComplete installer not found: $TestCompleteInstaller"
+        }
+
+
+        Write-Host `
+            "[INFO] Installing/upgrading TestComplete to baseline $TestCompleteTargetVersion..."
+
+
+        $LogFolder = `
+            Join-Path $WorkingRoot "TestCompleteLogs"
+
+
+        New-Item `
+            $LogFolder `
+            -ItemType Directory `
+            -Force |
+            Out-Null
+
+
+        $Arguments = @(
+
+            "-SilentInstall"
+
+            "-Log=$LogFolder"
+        )
+
+
+        $Arguments += `
+            $TestCompleteExtraArguments
+
+
+        $TCProcess = Start-Process `
+            -FilePath $TestCompleteInstaller `
+            -ArgumentList $Arguments `
+            -Wait `
+            -PassThru
+
+
+        if (
+            $TCProcess.ExitCode -notin @(0,3010)
+        ) {
+
+            throw `
+                "TestComplete installer returned exit code $($TCProcess.ExitCode)"
+        }
+
+
+        Write-Host "[OK] TestComplete installation completed."
+
+
+        Add-Result `
+            -Name "SmartBear TestComplete" `
+            -Status "Success" `
+            -Message "Installed / upgraded"
+    }
+}
+catch {
+
+    $Message = $_.Exception.Message
+
+    Write-Warning $Message
+
+
+    Add-Result `
+        -Name "SmartBear TestComplete" `
+        -Status "Warning" `
+        -Message $Message
+}
+
+
+# ============================================================
+# Application verification
+# ============================================================
+
+Write-Host ""
+Write-Host "=================================================="
+Write-Host " Application Verification"
+Write-Host "=================================================="
+
+
+$Verification = [ordered]@{
+
+    "Git" = @(
+
+        "C:\Program Files\Git\cmd\git.exe"
+    )
+
+
+    "SoapUI" = @(
+
+        "C:\Program Files\SmartBear\SoapUI-5.10.0\bin\SoapUI-5.10.0.exe",
+
+        "C:\Program Files\SmartBear\SoapUI*\bin\SoapUI*.exe"
+    )
+
+
+    "Power BI Desktop" = @(
+
+        "C:\Program Files\Microsoft Power BI Desktop\bin\PBIDesktop.exe"
+    )
+
+
+    "MySQL Workbench" = @(
+
+        "C:\Program Files\MySQL\MySQL Workbench 8.0 CE\MySQLWorkbench.exe"
+    )
+
+
+    "Visual Studio Code" = @(
+
+        "C:\Program Files\Microsoft VS Code\Code.exe"
+    )
+}
+
+
+foreach ($Entry in $Verification.GetEnumerator()) {
+
+    $Found = $false
+
+
+    foreach ($Pattern in $Entry.Value) {
+
+        $Match = Get-Item `
+            $Pattern `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
+
+        if ($Match) {
+
+            Write-Host "[OK] $($Entry.Key)"
+            Write-Host "     $($Match.FullName)"
+
+
+            $Found = $true
+
+            break
+        }
+    }
+
+
+    if (-not $Found) {
+
+        Write-Warning `
+            "$($Entry.Key) executable not found in expected location."
+    }
+}
+
+
+# ============================================================
+# Golden Image Cleanup
+# ============================================================
+
+Write-Host ""
+Write-Host "=================================================="
+Write-Host " Golden Image Cleanup"
+Write-Host "=================================================="
+
+
+# ------------------------------------------------------------
+# Working directory
+# ------------------------------------------------------------
+
+if (Test-Path $WorkingRoot) {
+
+    Remove-Item `
+        $WorkingRoot `
+        -Recurse `
+        -Force `
+        -ErrorAction SilentlyContinue
+
+
+    Write-Host `
+        "[OK] Removed installation working directory."
+}
+
+
+# ------------------------------------------------------------
+# User TEMP
+# ------------------------------------------------------------
+
+Write-Host "Cleaning current user TEMP..."
+
+
+Get-ChildItem `
+    $env:TEMP `
+    -Force `
+    -ErrorAction SilentlyContinue |
+    Remove-Item `
+        -Recurse `
+        -Force `
+        -ErrorAction SilentlyContinue
+
+
+# ------------------------------------------------------------
+# Windows TEMP
+# ------------------------------------------------------------
+
+Write-Host "Cleaning Windows TEMP..."
+
+
+Get-ChildItem `
+    "$env:SystemRoot\Temp" `
+    -Force `
+    -ErrorAction SilentlyContinue |
+    Remove-Item `
+        -Recurse `
+        -Force `
+        -ErrorAction SilentlyContinue
+
+
+# ------------------------------------------------------------
+# WinGet logs
+# ------------------------------------------------------------
+
+$WingetLogs = `
+    "$env:LOCALAPPDATA\Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\DiagOutputDir"
+
+
+if (Test-Path $WingetLogs) {
+
+    Remove-Item `
+        "$WingetLogs\*" `
+        -Recurse `
+        -Force `
+        -ErrorAction SilentlyContinue
+
+
+    Write-Host "[OK] Cleared WinGet logs."
+}
+
+
+# ------------------------------------------------------------
+# Recycle Bin
+# ------------------------------------------------------------
+
+try {
+
+    Clear-RecycleBin `
+        -Force `
+        -ErrorAction SilentlyContinue
+}
+catch {
+}
+
+
+# ------------------------------------------------------------
+# DISM
+# ------------------------------------------------------------
+
+if ($RunDISMCleanup) {
+
+    Write-Host ""
+    Write-Host "Running DISM StartComponentCleanup..."
+
+
+    $DISM = Start-Process `
+        -FilePath "dism.exe" `
+        -ArgumentList @(
+            "/Online"
+            "/Cleanup-Image"
+            "/StartComponentCleanup"
+            "/NoRestart"
+        ) `
+        -Wait `
+        -PassThru `
+        -NoNewWindow
+
+
+    if ($DISM.ExitCode -eq 0) {
+
+        Write-Host "[OK] DISM cleanup completed."
+    }
+
+
+    if ($DISM.ExitCode -ne 0) {
+
+        Write-Warning `
+            "DISM returned exit code $($DISM.ExitCode)"
+    }
+}
+
+
+# ============================================================
+# Summary
+# ============================================================
+
+Write-Host ""
+Write-Host "=================================================="
+Write-Host " Developer / Test Tools Summary"
+Write-Host "=================================================="
+Write-Host ""
+
+
+$Results |
+    Format-Table `
+        Application,
+        Status,
+        Message `
+        -AutoSize
+
+
+$Failures = @(
+    $Results |
+        Where-Object {
+            $_.Status -eq "Failed"
+        }
+)
+
+
+Write-Host ""
+
+
+if ($Failures.Count -gt 0) {
+
+    Write-Warning `
+        "$($Failures.Count) installation(s) failed."
+
+    exit 1
+}
+
+
+Write-Host `
+    "AVD Developer / Test Tools maintenance completed."
+
+exit 0
